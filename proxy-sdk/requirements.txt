@@ -1,0 +1,33 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# SDK Proxy -- Python runtime dependencies (pinned for reproducibility).
+# grpcio-tools is build-time only; see Dockerfile builder stage.
+
+grpcio==1.68.1
+grpcio-health-checking==1.68.1
+grpcio-reflection==1.68.1
+protobuf==5.29.6
+botocore==1.35.81
+httpx[http2]==0.27.2
+# Self-signed listener certificate; same pin as backend/requirements.txt.
+cryptography==50.0.1
+
+# Transitive dependency pins (supply-chain safety).
+#
+# Pinned exactly rather than floored, so a rebuild resolves the same versions a
+# scan was run against. h11 and httpcore move together: httpcore 1.0.7 declared
+# h11>=0.13,<0.15, which held h11 below the version that fixes CVE-2025-43859,
+# so the httpcore bump is a prerequisite rather than an extra.
+#
+# Note that pinning certifi means the CA trust bundle only advances when this
+# line is bumped. That is deliberate -- it makes builds reproducible -- but it
+# does make dependency-update automation the compensating control.
+h2==4.4.1
+hpack==4.2.0
+hyperframe==6.1.0
+httpcore==1.0.9
+h11==0.16.0
+certifi==2026.10.18
+urllib3==2.8.0
+idna==3.19

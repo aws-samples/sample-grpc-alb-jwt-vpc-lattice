@@ -1,0 +1,35 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
+syntax = "proto3";
+
+// Each proxy variant serves under its own package name.
+// This makes gRPC paths match ALB path-based routing rules:
+//   SDK proxy:   /sdk.DemoService/GetInfo   -> matches /sdk.*
+//   Envoy proxy: /envoy.DemoService/GetInfo -> matches /envoy.*
+//   Backend:     /demo.DemoService/GetInfo  (internal, behind Lattice)
+//
+// Two backend services are deployed from this same proto: User Service
+// and Order Service. Each proxy is authorized (via its ECS task role and
+// the per-service VPC Lattice auth policy) to reach exactly one of them,
+// demonstrating a 1:1 mapping between signing approach and backend service.
+
+// Backend service definition (used by VPC Lattice target groups)
+package demo;
+
+service DemoService {
+  rpc GetInfo (InfoRequest) returns (InfoResponse);
+}
+
+message InfoRequest {
+  string id = 1;
+}
+
+message InfoResponse {
+  string service_name = 1;
+  string request_id = 2;
+  string client_id = 3;
+  string client_scope = 4;
+  string client_sub = 5;
+  string message = 6;
+}

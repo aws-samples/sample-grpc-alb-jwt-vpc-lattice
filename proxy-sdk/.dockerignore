@@ -1,0 +1,17 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Keep the build context minimal -- only server.py, requirements.txt, the
+# proto files (copied in by build-and-push.sh), and the Dockerfile.
+
+__pycache__/
+*.py[cod]
+*_pb2.py
+*_pb2_grpc.py
+.env
+*.pem
+*.key
+*.log
+.DS_Store
+README.md
+SECURITY-REVIEW.md

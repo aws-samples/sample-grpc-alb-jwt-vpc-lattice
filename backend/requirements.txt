@@ -1,0 +1,11 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Backend service — runtime dependencies (pinned for reproducibility).
+# grpcio-tools is build-time only; see Dockerfile builder stage.
+
+grpcio==1.68.1
+grpcio-health-checking==1.68.1
+grpcio-reflection==1.68.1
+protobuf==5.29.6
+cryptography==50.0.1
