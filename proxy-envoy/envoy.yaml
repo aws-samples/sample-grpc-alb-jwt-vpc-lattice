@@ -1,0 +1,463 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# =============================================================================
+# Envoy Proxy Configuration -- gRPC SigV4 Signing for Amazon VPC Lattice
+# =============================================================================
+# ECS Proxy -- Option 2: Envoy signing filter.
+#
+# Accepts gRPC traffic under package "envoy" (/envoy.DemoService/GetInfo ->
+# matches ALB rule /envoy.*), extracts JWT claims from the OAuth2
+# authorization header, rewrites host/path for the VPC Lattice Order
+# Service, signs requests with SigV4, and forwards over HTTP/2 + TLS. This
+# proxy's ECS task role (EnvoyTaskRole) is authorized only for the Order
+# Service; a request to the User Service is denied by VPC Lattice, because
+# neither this role's IAM policy nor the User Service auth policy allows it.
+#
+# Filter ordering is a security requirement: the Lua filter MUST run before
+# aws_request_signing so that :authority and :path hold their final values
+# before the SigV4 signature is computed. Rewriting the host afterwards (for
+# example with auto_host_rewrite on the route) signs the old host and VPC
+# Lattice rejects the request with InvalidSignatureException.
+#
+# JWT claim extraction uses a pure-Lua base64 decoder so that real
+# client_id/scope/sub claims are forwarded. Never fall back to placeholder
+# values here: these claims become SigV4-signed headers that VPC Lattice auth
+# policies evaluate, so a placeholder would mean policies authorizing
+# fabricated identity.
+#
+# The listener serves TLS (ALPN h2) with a self-signed certificate that
+# docker-entrypoint.sh generates at container start, so the JWT in the
+# authorization header is encrypted between the ALB and this proxy. The
+# ALB does not validate target certificates, so no CA or rotation is needed.
+#
+# Environment variables (substituted at container start):
+#   VPC_LATTICE_ENDPOINT -- FQDN of the VPC Lattice Order Service
+#   AWS_REGION           -- AWS region for SigV4 signing
+# =============================================================================
+
+static_resources:
+  listeners:
+  - name: grpc_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8443
+    per_connection_buffer_limit_bytes: 1048576  # 1 MiB
+    filter_chains:
+    - transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            # h2 only: the ALB target group uses ProtocolVersion HTTP2.
+            alpn_protocols: ["h2"]
+            tls_params:
+              tls_minimum_protocol_version: TLSv1_2
+            tls_certificates:
+            - certificate_chain:
+                filename: /tmp/tls/cert.pem
+              private_key:
+                filename: /tmp/tls/key.pem
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: grpc_proxy
+          codec_type: AUTO
+          # --- Security: request size & timeout limits ---
+          request_headers_timeout: 10s
+          stream_idle_timeout: 300s
+          max_request_headers_kb: 64
+          common_http_protocol_options:
+            idle_timeout: 900s
+            max_headers_count: 100
+          http2_protocol_options:
+            max_concurrent_streams: 100
+            initial_stream_window_size: 1048576   # 1 MiB
+            initial_connection_window_size: 2097152  # 2 MiB
+          # --- Access logging for observability ---
+          access_log:
+          - name: envoy.access_loggers.stdout
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+              log_format:
+                json_format:
+                  timestamp: "%START_TIME%"
+                  method: "%REQ(:METHOD)%"
+                  path: "%REQ(:PATH)%"
+                  protocol: "%PROTOCOL%"
+                  response_code: "%RESPONSE_CODE%"
+                  grpc_status: "%RESP(grpc-status)%"
+                  duration_ms: "%DURATION%"
+                  upstream_host: "%UPSTREAM_HOST%"
+                  client_id: "%REQ(x-client-id)%"
+                  bytes_sent: "%BYTES_SENT%"
+                  bytes_received: "%BYTES_RECEIVED%"
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: lattice_backend
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/"
+                  grpc: {}
+                route:
+                  cluster: vpc_lattice_cluster
+                  timeout: 30s
+                  max_stream_duration:
+                    max_stream_duration: 300s
+          http_filters:
+          # =================================================================
+          # FILTER 1: Lua -- JWT decode, claim extraction, host/path rewrite
+          # =================================================================
+          # This filter MUST run before aws_request_signing so that
+          # :authority and :path are set to their final values before the
+          # SigV4 signature is computed.
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              default_source_code:
+                inline_string: |
+                  -- =============================================================
+                  -- Pure Lua Base64 Decoder
+                  -- Envoy's Lua sandbox does not expose native base64 decoding.
+                  -- This enables real JWT claim extraction instead of falling
+                  -- back to hardcoded placeholder values.
+                  -- =============================================================
+                  local b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+                  local b64lookup = {}
+                  for i = 1, #b64chars do b64lookup[b64chars:sub(i,i)] = i - 1 end
+
+                  local function base64_decode(data)
+                    data = data:gsub('[^'..b64chars..'=]', '')
+                    return (data:gsub('.', function(x)
+                      if x == '=' then return '' end
+                      local r, f = '', b64lookup[x]
+                      for i = 6, 1, -1 do r = r .. (f % 2^i - f % 2^(i-1) > 0 and '1' or '0') end
+                      return r
+                    end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
+                      if #x ~= 8 then return '' end
+                      local c = 0
+                      for i = 1, 8 do c = c + (x:sub(i,i) == '1' and 2^(8-i) or 0) end
+                      return string.char(c)
+                    end))
+                  end
+
+                  -- =============================================================
+                  -- Claim size limits and header-value sanitization
+                  --
+                  -- These limits and this sanitizer mirror MAX_JWT_LENGTH and
+                  -- _sanitize_header_value() in proxy-sdk/server.py, so both
+                  -- proxies in this sample enforce the same bounds. Keep them in
+                  -- step if either side changes.
+                  -- =============================================================
+                  local MAX_JWT_LENGTH = 16384      -- 16 KB, matches proxy-sdk
+                  local MAX_CLIENT_ID_LENGTH = 256
+                  local MAX_SCOPE_LENGTH = 1024
+                  local MAX_SUB_LENGTH = 256
+
+                  -- Make a JWT claim safe to use as an outbound header value.
+                  --
+                  -- Why this matters: these values become x-client-id /
+                  -- x-client-scope / x-client-sub, which are covered by the SigV4
+                  -- signature AND evaluated by VPC Lattice auth policies. A claim
+                  -- containing CR/LF could attempt header injection, and a claim
+                  -- containing control characters could cause a signature or
+                  -- verification mismatch between what we sign and what the
+                  -- upstream parses.
+                  --
+                  -- Strip rather than reject, so a malformed-but-harmless claim
+                  -- degrades to a usable value instead of failing the request
+                  -- outright. Anything outside printable ASCII (0x20-0x7E) goes.
+                  local function sanitize_header_value(value, max_length)
+                    if not value or value == '' then return '' end
+                    local cleaned = value:gsub('[^\032-\126]', '')
+                    return string.sub(cleaned, 1, max_length)
+                  end
+
+                  -- Read a JSON string literal starting at the opening quote.
+                  -- Returns the unescaped contents and the index just past the
+                  -- closing quote, or nil if the string is unterminated.
+                  --
+                  -- Escapes are decoded so that a claim containing \n arrives as
+                  -- a real newline and is then stripped by sanitize_header_value,
+                  -- which is what proxy-sdk/server.py does via json.loads. \uXXXX
+                  -- is skipped rather than half-decoded -- Lua has no UTF-8
+                  -- support here, and any non-ASCII result would be stripped
+                  -- anyway.
+                  local function read_json_string(s, i)
+                    local out = {}
+                    local n = #s
+                    local escapes = { n = '\n', r = '\r', t = '\t', b = '\b', f = '\f' }
+                    i = i + 1
+                    while i <= n do
+                      local c = string.sub(s, i, i)
+                      if c == '"' then
+                        return table.concat(out), i + 1
+                      elseif c == '\\' then
+                        local nxt = string.sub(s, i + 1, i + 1)
+                        if nxt == 'u' then
+                          i = i + 6
+                        else
+                          table.insert(out, escapes[nxt] or nxt)
+                          i = i + 2
+                        end
+                      else
+                        table.insert(out, c)
+                        i = i + 1
+                      end
+                    end
+                    return nil, i
+                  end
+
+                  -- Find a string-valued key at the TOP LEVEL of a JSON object.
+                  --
+                  -- Envoy's Lua sandbox ships no JSON decoder, so this is a
+                  -- single-pass scan rather than a full parse. It tracks nesting
+                  -- depth and string state, and only treats a string as a key when
+                  -- it sits at depth 1 and is followed by a colon.
+                  --
+                  -- That depth check is the point. A pattern match anywhere in the
+                  -- payload would happily capture a same-named key nested inside
+                  -- another object -- {"meta":{"client_id":"evil"},
+                  -- "client_id":"legit"} returns "evil" from any such pattern,
+                  -- including one anchored to a { or , delimiter, because the
+                  -- nested key IS preceded by {. Only depth tracking excludes it.
+                  --
+                  -- Returns nil if the payload is not an object, is truncated, or
+                  -- does not carry the key with a string value.
+                  local function json_top_level_string(payload, key)
+                    local n = #payload
+                    local i = 1
+                    while i <= n and string.match(string.sub(payload, i, i), '%s') do
+                      i = i + 1
+                    end
+                    if string.sub(payload, i, i) ~= '{' then return nil end
+                    i = i + 1
+
+                    local depth = 1
+                    while i <= n do
+                      local c = string.sub(payload, i, i)
+                      if c == '"' then
+                        local text, after = read_json_string(payload, i)
+                        if not text then return nil end
+                        i = after
+                        if depth == 1 then
+                          -- A key is a string followed by a colon.
+                          local j = i
+                          while j <= n and string.match(string.sub(payload, j, j), '%s') do
+                            j = j + 1
+                          end
+                          if string.sub(payload, j, j) == ':' then
+                            j = j + 1
+                            while j <= n and string.match(string.sub(payload, j, j), '%s') do
+                              j = j + 1
+                            end
+                            if string.sub(payload, j, j) == '"' then
+                              local value, vafter = read_json_string(payload, j)
+                              if text == key then return value end
+                              if not value then return nil end
+                              i = vafter
+                            else
+                              -- Non-string value; let the main loop walk it.
+                              i = j
+                            end
+                          end
+                        end
+                      elseif c == '{' or c == '[' then
+                        depth = depth + 1
+                        i = i + 1
+                      elseif c == '}' or c == ']' then
+                        depth = depth - 1
+                        i = i + 1
+                        if depth <= 0 then return nil end
+                      else
+                        i = i + 1
+                      end
+                    end
+                    return nil
+                  end
+
+                  -- Extract one claim, top-level only, sanitized and bounded.
+                  local function extract_claim(payload, key, max_length)
+                    return sanitize_header_value(json_top_level_string(payload, key), max_length)
+                  end
+
+                  -- =============================================================
+                  -- Request handler: decode JWT -> set identity headers -> rewrite
+                  -- =============================================================
+                  function envoy_on_request(request_handle)
+                    -- Strip any caller-supplied identity headers BEFORE
+                    -- deriving them from the JWT. Envoy's Lua add() appends
+                    -- to an existing header instead of replacing it
+                    -- (envoyproxy/envoy#2414), so without these removes a
+                    -- client could send its own x-client-id and have it
+                    -- survive alongside the value taken from the token.
+                    request_handle:headers():remove("x-client-id")
+                    request_handle:headers():remove("x-client-scope")
+                    request_handle:headers():remove("x-client-sub")
+
+                    local auth = request_handle:headers():get("authorization")
+                    local client_id = "unknown"
+                    local scope = ""
+                    local sub = ""
+
+                    -- Require a literal "Bearer " prefix rather than blindly
+                    -- stripping seven characters, so "Basic ..." or any other
+                    -- scheme is not mistaken for a bearer token. Matches the
+                    -- startswith("bearer ") check in proxy-sdk/server.py.
+                    if auth and #auth > 7 and string.lower(string.sub(auth, 1, 7)) == "bearer " then
+                      local token = string.sub(auth, 8)
+
+                      -- Size guard BEFORE any decoding work. The pure-Lua decoder
+                      -- above builds strings by repeated concatenation, which is
+                      -- super-linear in Lua, so an oversized token carries a real
+                      -- CPU cost per request. max_request_headers_kb bounds the
+                      -- input too; this is the explicit in-filter limit, and it
+                      -- matches MAX_JWT_LENGTH in proxy-sdk/server.py.
+                      if #token > MAX_JWT_LENGTH then
+                        request_handle:logWarn("JWT exceeds maximum length, skipping claim decode")
+                      else
+                        -- Split JWT on "." and get the payload (second segment)
+                        local i = 0
+                        local payload_b64 = nil
+                        for part in string.gmatch(token, "[^%.]+") do
+                          i = i + 1
+                          if i == 2 then
+                            payload_b64 = part
+                            break
+                          end
+                        end
+
+                        if payload_b64 then
+                          -- Convert base64url to standard base64
+                          local b64 = payload_b64:gsub("-", "+"):gsub("_", "/")
+                          local pad = 4 - (#b64 % 4)
+                          if pad < 4 then
+                            b64 = b64 .. string.rep("=", pad)
+                          end
+
+                          local decoded = base64_decode(b64)
+
+                          -- Re-check size after decoding. json_top_level_string
+                          -- rejects anything that is not a JSON object, so there
+                          -- is no separate shape check here.
+                          if decoded and #decoded > 0 and #decoded <= MAX_JWT_LENGTH then
+                            local cid = extract_claim(decoded, "client_id", MAX_CLIENT_ID_LENGTH)
+                            local sc  = extract_claim(decoded, "scope", MAX_SCOPE_LENGTH)
+                            local su  = extract_claim(decoded, "sub", MAX_SUB_LENGTH)
+                            if cid ~= '' then client_id = cid end
+                            if sc  ~= '' then scope = sc end
+                            if su  ~= '' then sub = su end
+                          end
+                        end
+                      end
+                    end
+
+                    -- Set translated identity headers for downstream VPC
+                    -- Lattice auth policies.
+                    request_handle:headers():add("x-client-id", client_id)
+                    request_handle:headers():add("x-client-scope", scope)
+                    request_handle:headers():add("x-client-sub", sub)
+
+                    -- Remove the original authorization header (SigV4
+                    -- filter will set its own).
+                    request_handle:headers():remove("authorization")
+
+                    -- -------------------------------------------------------
+                    -- Host rewrite: set :authority to the VPC Lattice FQDN.
+                    -- MUST happen BEFORE aws_request_signing computes the
+                    -- signature.
+                    -- -------------------------------------------------------
+                    request_handle:headers():replace(":authority", "${VPC_LATTICE_ENDPOINT}")
+                    request_handle:headers():replace("host", "${VPC_LATTICE_ENDPOINT}")
+
+                    -- -------------------------------------------------------
+                    -- Path rewrite: translate gRPC package name.
+                    -- /envoy.DemoService/GetInfo -> /demo.DemoService/GetInfo
+                    -- The client uses the "envoy" package alias; the VPC
+                    -- Lattice backend expects the canonical "demo" package
+                    -- name.
+                    -- -------------------------------------------------------
+                    local path = request_handle:headers():get(":path")
+                    if path then
+                      local new_path = path:gsub("^/envoy%.", "/demo.")
+                      if new_path ~= path then
+                        request_handle:headers():replace(":path", new_path)
+                      end
+                    end
+                  end
+
+          # =================================================================
+          # FILTER 2: AWS SigV4 Signing
+          # =================================================================
+          # Signs the request using IAM credentials from the ECS task
+          # role. The signature covers :authority and :path as rewritten
+          # by the Lua filter above.
+          - name: envoy.filters.http.aws_request_signing
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.aws_request_signing.v3.AwsRequestSigning
+              service_name: vpc-lattice-svcs
+              region: ${AWS_REGION}
+              use_unsigned_payload: true
+              match_excluded_headers:
+              - prefix: x-forwarded
+              - prefix: x-amzn-trace
+              - prefix: x-envoy
+
+          # =================================================================
+          # FILTER 3: Router
+          # =================================================================
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+  - name: vpc_lattice_cluster
+    type: LOGICAL_DNS
+    lb_policy: ROUND_ROBIN
+    dns_lookup_family: V4_ONLY
+    circuit_breakers:
+      thresholds:
+      - priority: DEFAULT
+        max_connections: 128
+        max_pending_requests: 128
+        max_requests: 128
+        max_retries: 3
+    load_assignment:
+      cluster_name: vpc_lattice_cluster
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: "${VPC_LATTICE_ENDPOINT}"
+                port_value: 443
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: "${VPC_LATTICE_ENDPOINT}"
+        common_tls_context:
+          validation_context:
+            trusted_ca:
+              filename: /etc/ssl/certs/ca-certificates.crt
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options:
+            max_concurrent_streams: 100
+
+# =============================================================================
+# Admin Interface -- bound to localhost only (not externally accessible)
+# =============================================================================
+# The /ready endpoint is used for the container health check via
+# localhost. Never expose this on 0.0.0.0.
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901

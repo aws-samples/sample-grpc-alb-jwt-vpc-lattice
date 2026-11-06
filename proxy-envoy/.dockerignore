@@ -1,0 +1,13 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Keep the build context minimal -- only envoy.yaml, docker-entrypoint.sh,
+# and the Dockerfile.
+
+.env
+*.pem
+*.key
+*.log
+.DS_Store
+README.md
+SECURITY-REVIEW.md

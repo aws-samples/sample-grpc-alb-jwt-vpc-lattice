@@ -1,0 +1,1576 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Authenticate and authorize external gRPC clients with ALB JWT verification
+  and Amazon VPC Lattice. Deploys an ingress VPC (ALB with jwt-validation,
+  two ECS proxy variants on Fargate, Cognito) and a backend VPC (two gRPC
+  services behind a VPC Lattice service network with per-service IAM auth
+  policies). Two SigV4 signing approaches map 1:1 to backend services:
+  SDK -> SdkTaskRole -> /sdk.* -> User Service; Envoy -> EnvoyTaskRole ->
+  /envoy.* -> Order Service. Each role can invoke ONLY its mapped service;
+  a request signed by the wrong role is denied by VPC Lattice (gRPC status
+  7, PERMISSION_DENIED).
+
+# ---
+# Metadata
+# ---
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Required
+        Parameters:
+          - CertificateArn
+      - Label:
+          default: Container images
+        Parameters:
+          - SdkProxyImageUri
+          - EnvoyProxyImageUri
+          - BackendImageUri
+      - Label:
+          default: Networking
+        Parameters:
+          - IngressVpcCidr
+          - BackendVpcCidr
+      - Label:
+          default: Sizing and retention
+        Parameters:
+          - ProxyDesiredCount
+          - BackendDesiredCount
+          - LogRetentionDays
+
+# ---
+# Parameters
+# ---
+Parameters:
+
+  CertificateArn:
+    Type: String
+    Description: >
+      ACM certificate ARN for the ALB HTTPS listener. gRPC requires TLS from
+      the client to the ALB, so this is mandatory.
+    AllowedPattern: '^arn:aws[a-zA-Z-]*:acm:.+$'
+    ConstraintDescription: Must be a valid ACM certificate ARN.
+
+  # Container images. Build with ./build-and-push.sh, which pushes to ECR in
+  # your own account, then pass the resulting URIs here.
+  #
+  # These deliberately have no Default: the images are built from source,
+  # so there is no shared registry to point a default at.
+  SdkProxyImageUri:
+    Type: String
+    MinLength: 1
+    Description: Image URI for the native SDK signing proxy (proxy-sdk).
+
+  EnvoyProxyImageUri:
+    Type: String
+    MinLength: 1
+    Description: Image URI for the Envoy signing proxy (proxy-envoy).
+
+  BackendImageUri:
+    Type: String
+    MinLength: 1
+    Description: >
+      Image URI for the backend gRPC service (backend). The same image is
+      deployed twice, as User Service and Order Service, differentiated by
+      the SERVICE_NAME environment variable.
+
+  IngressVpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    Description: CIDR for the ingress VPC (ALB + proxy tier).
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  BackendVpcCidr:
+    Type: String
+    Default: 10.21.0.0/16
+    Description: CIDR for the backend VPC (gRPC services behind VPC Lattice).
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  ProxyDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired task count per proxy service.
+
+  BackendDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired task count per backend service.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+    Description: CloudWatch Logs retention in days.
+
+  ProxyListenPort:
+    Type: Number
+    Default: 8443
+    MinValue: 1
+    MaxValue: 65535
+    Description: >
+      Port both proxies listen on for inbound gRPC from the ALB. The template
+      passes it to the SDK proxy as LISTEN_PORT. The Envoy listener port is
+      fixed at 8443 in proxy-envoy/envoy.yaml, so if you change this value,
+      change that file to match and rebuild the image.
+
+  BackendGrpcPort:
+    Type: Number
+    Default: 50051
+    MinValue: 1
+    MaxValue: 65535
+    Description: >
+      Port the backend gRPC services listen on (TLS). Must match GRPC_PORT
+      in the backend container and the VPC Lattice target group port.
+
+Resources:
+
+  # ---
+  # INGRESS VPC — ALB and ECS proxy tier
+  # ---
+  IngressVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref IngressVpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ingress-vpc
+
+  IngressIgw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ingress-igw
+
+  IngressIgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref IngressVpc
+      InternetGatewayId: !Ref IngressIgw
+
+  # --- Public subnets (ALB) ---
+  IngressPublicA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref IngressVpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref IngressVpcCidr, 8, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ingress-public-a
+
+  IngressPublicB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref IngressVpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref IngressVpcCidr, 8, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ingress-public-b
+
+  IngressPublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref IngressVpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ingress-public-rt
+
+  IngressPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IngressIgwAttach
+    Properties:
+      RouteTableId: !Ref IngressPublicRt
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IngressIgw
+
+  IngressPublicARtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref IngressPublicA
+      RouteTableId: !Ref IngressPublicRt
+
+  IngressPublicBRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref IngressPublicB
+      RouteTableId: !Ref IngressPublicRt
+
+  # --- Private subnets (ECS proxy tasks) ---
+  IngressPrivateA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref IngressVpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      CidrBlock: !Select [2, !Cidr [!Ref IngressVpcCidr, 8, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ingress-private-a
+
+  IngressPrivateB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref IngressVpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      CidrBlock: !Select [3, !Cidr [!Ref IngressVpcCidr, 8, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ingress-private-b
+
+  # No NAT gateway and no default route: the proxy tasks reach VPC Lattice
+  # through its managed prefix list, and image pulls, logs and ECS Exec go
+  # through VPC endpoints. The S3 gateway endpoint adds its route here.
+  IngressPrivateRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref IngressVpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ingress-private-rt
+
+  IngressPrivateARtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref IngressPrivateA
+      RouteTableId: !Ref IngressPrivateRt
+
+  IngressPrivateBRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref IngressPrivateB
+      RouteTableId: !Ref IngressPrivateRt
+
+  # ---
+  # BACKEND VPC — gRPC services behind VPC Lattice
+  # No NAT gateway: egress for image pulls and logs is via VPC endpoints only.
+  # ---
+  BackendVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref BackendVpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-backend-vpc
+
+  BackendPrivateA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref BackendVpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      CidrBlock: !Select [0, !Cidr [!Ref BackendVpcCidr, 8, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-backend-private-a
+
+  BackendPrivateB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref BackendVpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      CidrBlock: !Select [1, !Cidr [!Ref BackendVpcCidr, 8, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-backend-private-b
+
+  BackendRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BackendVpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-backend-rt
+
+  BackendARtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref BackendPrivateA
+      RouteTableId: !Ref BackendRt
+
+  BackendBRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref BackendPrivateB
+      RouteTableId: !Ref BackendRt
+
+  # ---
+  # Security groups
+  # ---
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - accepts gRPC over HTTPS from the internet
+      VpcId: !Ref IngressVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: gRPC over HTTPS from external clients
+      # The ALB reaches only the proxy targets and the public Cognito JWKS
+      # host, which has no VPC endpoint, so 443 to the internet is required.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref ProxyListenPort
+          ToPort: !Ref ProxyListenPort
+          CidrIp: !Ref IngressVpcCidr
+          Description: gRPC over HTTP/2 to the proxy tasks
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to the Cognito JWKS endpoint
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-alb-sg
+
+  # Proxy tasks accept traffic ONLY from the ALB security group. There is no
+  # path from the internet to the proxy listener.
+  EcsProxySg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS proxy tasks - inbound from ALB only
+      VpcId: !Ref IngressVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ProxyListenPort
+          ToPort: !Ref ProxyListenPort
+          SourceSecurityGroupId: !Ref AlbSg
+          Description: gRPC over HTTP/2 from the ALB
+      # No internet egress. The Lattice data plane is reached through its
+      # managed prefix list (link-local plus non-routable public ranges);
+      # image pulls, logs and ECS Exec all go through VPC endpoints.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !GetAtt LatticePrefixList.PrefixListId
+          Description: HTTPS to the VPC Lattice data plane
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref IngressVpceSg
+          Description: HTTPS to interface endpoints (ECR, logs, SSM)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !GetAtt S3PrefixList.PrefixListId
+          Description: HTTPS to S3 for ECR image layers
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-proxy-sg
+
+  # Backend tasks accept traffic ONLY from the VPC Lattice data plane.
+  # Lattice reaches targets from link-local addresses in its managed prefix
+  # list (NOT from the VPC CIDR), so the prefix list must be used here.
+  BackendSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Backend gRPC tasks - inbound from VPC Lattice only
+      VpcId: !Ref BackendVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref BackendGrpcPort
+          ToPort: !Ref BackendGrpcPort
+          SourcePrefixListId: !GetAtt LatticePrefixList.PrefixListId
+          Description: gRPC over TLS from the VPC Lattice data plane
+      # Replies to Lattice need no egress rule (security groups are
+      # stateful). Only image pulls, logs and ECS Exec leave the task.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref BackendVpceSg
+          Description: HTTPS to interface endpoints (ECR, logs, SSM)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !GetAtt S3PrefixList.PrefixListId
+          Description: HTTPS to S3 for ECR image layers
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-backend-sg
+
+  # Security group on the ingress VPC -> service network association.
+  # This governs INBOUND traffic from clients to VPC Lattice. Without TCP 443
+  # allowed from the ingress VPC CIDR, proxy tasks time out connecting to the
+  # Lattice link-local endpoint.
+  LatticeAssocSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC Lattice service network association - client inbound
+      VpcId: !Ref IngressVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref IngressVpcCidr
+          Description: HTTPS from ingress VPC to VPC Lattice
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !GetAtt LatticePrefixList.PrefixListId
+          Description: HTTPS onward to the VPC Lattice data plane
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-lattice-assoc-sg
+
+  IngressVpceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface VPC endpoints in the ingress VPC
+      VpcId: !Ref IngressVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref IngressVpcCidr
+          Description: HTTPS from within the ingress VPC
+      # Endpoint ENIs only answer requests, so this is belt-and-braces.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref IngressVpcCidr
+          Description: HTTPS within the ingress VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ingress-vpce-sg
+
+  BackendVpceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface VPC endpoints in the backend VPC
+      VpcId: !Ref BackendVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref BackendVpcCidr
+          Description: HTTPS from within the backend VPC
+      # Endpoint ENIs only answer requests, so this is belt-and-braces.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref BackendVpcCidr
+          Description: HTTPS within the backend VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-backend-vpce-sg
+
+  # ---
+  # VPC endpoints — ingress VPC
+  # ECR (api + dkr) and S3 are required for image pulls; logs for awslogs;
+  # ssmmessages for ECS Exec troubleshooting.
+  # ---
+  IngressEcrApi:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref IngressVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref IngressPrivateA, !Ref IngressPrivateB]
+      SecurityGroupIds: [!Ref IngressVpceSg]
+
+  IngressEcrDkr:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref IngressVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref IngressPrivateA, !Ref IngressPrivateB]
+      SecurityGroupIds: [!Ref IngressVpceSg]
+
+  IngressS3Gw:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref IngressVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref IngressPrivateRt]
+
+  IngressLogs:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref IngressVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref IngressPrivateA, !Ref IngressPrivateB]
+      SecurityGroupIds: [!Ref IngressVpceSg]
+
+  IngressSsmMessages:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref IngressVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref IngressPrivateA, !Ref IngressPrivateB]
+      SecurityGroupIds: [!Ref IngressVpceSg]
+
+  # ---
+  # VPC endpoints — backend VPC
+  # ---
+  BackendEcrApi:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BackendVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref BackendPrivateA, !Ref BackendPrivateB]
+      SecurityGroupIds: [!Ref BackendVpceSg]
+
+  BackendEcrDkr:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BackendVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref BackendPrivateA, !Ref BackendPrivateB]
+      SecurityGroupIds: [!Ref BackendVpceSg]
+
+  BackendS3Gw:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BackendVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref BackendRt]
+
+  BackendLogsVpce:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BackendVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref BackendPrivateA, !Ref BackendPrivateB]
+      SecurityGroupIds: [!Ref BackendVpceSg]
+
+  BackendSsmMessages:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BackendVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref BackendPrivateA, !Ref BackendPrivateB]
+      SecurityGroupIds: [!Ref BackendVpceSg]
+
+  # ---
+  # VPC Lattice managed prefix list lookup
+  # CloudFormation cannot resolve an AWS-managed prefix list ID natively, so
+  # a small custom resource looks it up. The backend security group needs it
+  # because Lattice reaches targets from link-local addresses, not the VPC
+  # CIDR.
+  # ---
+  PrefixListLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DescribePrefixLists
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # No resource-level permissions for this action, so Resource must
+              # be "*"; aws:RequestedRegion is the scope that is available.
+              - Effect: Allow
+                Action: ec2:DescribeManagedPrefixLists
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+
+  PrefixListLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt PrefixListLookupRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  name = event["ResourceProperties"]["PrefixListName"]
+
+                  ec2 = boto3.client("ec2")
+                  resp = ec2.describe_managed_prefix_lists(
+                      Filters=[{"Name": "prefix-list-name", "Values": [name]}]
+                  )
+                  lists = resp.get("PrefixLists", [])
+                  if not lists:
+                      raise RuntimeError(f"Managed prefix list not found: {name}")
+
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.SUCCESS,
+                      {"PrefixListId": lists[0]["PrefixListId"]},
+                  )
+              except Exception as exc:
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED, {}, reason=str(exc)
+                  )
+
+  LatticePrefixList:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+      PrefixListName: !Sub com.amazonaws.${AWS::Region}.vpc-lattice
+
+  # Egress rules use this to reach S3 via the gateway endpoint (ECR layers).
+  S3PrefixList:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+      PrefixListName: !Sub com.amazonaws.${AWS::Region}.s3
+
+  # ---
+  # Amazon Cognito — JWT issuer using the client_credentials grant
+  # Machine-to-machine only: no hosted UI login flow, no browser redirect.
+  # ---
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-pool
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+
+  # A domain is required to expose the /oauth2/token endpoint used by the
+  # client_credentials grant.
+  CognitoDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub ${AWS::StackName}-${AWS::AccountId}
+      UserPoolId: !Ref CognitoUserPool
+
+  CognitoResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Identifier: https://grpc-lattice-demo
+      Name: gRPC Lattice Demo API
+      Scopes:
+        - ScopeName: invoke
+          ScopeDescription: Invoke gRPC services
+
+  CognitoClientSdk:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: CognitoResourceServer
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-client-sdk
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: [https://grpc-lattice-demo/invoke]
+      # Short token lifetime: ALB JWT validation cannot check revocation,
+      # so a signed token is valid until it expires. 5 minutes is the
+      # Cognito minimum for access tokens.
+      AccessTokenValidity: 5
+      TokenValidityUnits:
+        AccessToken: minutes
+
+  CognitoClientEnvoy:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: CognitoResourceServer
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-client-envoy
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: [https://grpc-lattice-demo/invoke]
+      AccessTokenValidity: 5
+      TokenValidityUnits:
+        AccessToken: minutes
+
+  # ---
+  # Application Load Balancer — JWT verification and gRPC path routing
+  # ---
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${AWS::StackName}-alb
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref IngressPublicA, !Ref IngressPublicB]
+      SecurityGroups: [!Ref AlbSg]
+      # Drops malformed headers -- HTTP desync defence (Security Hub ELB.4).
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-alb
+
+  # HTTPS + HTTP2: the JWT stays encrypted to the proxy. Proxies use a
+  # self-signed cert made at startup; the ALB does not validate target certs.
+  # Protocol is replace-only, so the names changed with it (was -sdk-tg).
+  SdkTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}-sdk-tls
+      VpcId: !Ref IngressVpc
+      TargetType: ip
+      Port: !Ref ProxyListenPort
+      Protocol: HTTPS
+      ProtocolVersion: HTTP2
+      HealthCheckProtocol: HTTPS
+      HealthCheckPort: traffic-port
+      # Probe path is the gRPC health method; an HTTP/2 GET does not invoke
+      # it, so the broad matcher checks liveness, TLS and HTTP/2 only.
+      HealthCheckPath: /grpc.health.v1.Health/Check
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        # Broad: a gRPC endpoint answers an HTTP/2 probe in this range even
+        # when the probe is not a valid gRPC call.
+        HttpCode: '200-499'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        # HTTP/2 connection reuse can concentrate load on a few tasks;
+        # this spreads it without downgrading to HTTP/1.1 (breaks gRPC).
+        - Key: load_balancing.algorithm.type
+          Value: least_outstanding_requests
+
+  EnvoyTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}-envoy-tls
+      VpcId: !Ref IngressVpc
+      TargetType: ip
+      Port: !Ref ProxyListenPort
+      Protocol: HTTPS
+      ProtocolVersion: HTTP2
+      HealthCheckProtocol: HTTPS
+      HealthCheckPort: traffic-port
+      # Envoy routes only gRPC requests to the upstream cluster; a plain
+      # HTTP/2 probe on "/" returns a 404, which the matcher below accepts
+      # as proof that the listener is up.
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200-499'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: load_balancing.algorithm.type
+          Value: least_outstanding_requests
+
+  # The default action validates the JWT and then returns 404, so an
+  # authenticated request to an unknown path is not silently forwarded.
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: jwt-validation
+          Order: 1
+          JwtValidationConfig:
+            Issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}
+            JwksEndpoint: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}/.well-known/jwks.json
+        - Type: fixed-response
+          Order: 2
+          FixedResponseConfig:
+            StatusCode: '404'
+            ContentType: text/plain
+            MessageBody: Route not found
+
+  # Path patterns match the gRPC package name: a call to
+  # /sdk.DemoService/GetInfo begins with "/sdk." and so matches "/sdk.*".
+  SdkRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: ['/sdk.*']
+      Actions:
+        - Type: jwt-validation
+          Order: 1
+          JwtValidationConfig:
+            Issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}
+            JwksEndpoint: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}/.well-known/jwks.json
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref SdkTg
+
+  EnvoyRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: ['/envoy.*']
+      Actions:
+        - Type: jwt-validation
+          Order: 1
+          JwtValidationConfig:
+            Issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}
+            JwksEndpoint: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}/.well-known/jwks.json
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref EnvoyTg
+
+  # ---
+  # IAM roles
+  #
+  # The two proxy task roles are the workload identities VPC Lattice resolves
+  # from the SigV4 signature. Keeping them separate is what makes the
+  # per-service auth policies meaningful: each role invokes exactly one
+  # service.
+  #
+  # The vpc-lattice-svcs:Invoke grants are separate IAM policy resources
+  # below, not inline: inlining creates a dependency cycle, since the service
+  # auth policies reference these role ARNs and the role policies reference
+  # the service ARNs.
+  # ---
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ecs-execution-role
+
+  # Shared trust + ECS Exec permissions for task roles. ECS Exec is included
+  # to make the walkthrough debuggable; remove it for production.
+  SdkTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-sdk-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-sdk-role
+
+  EnvoyTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-envoy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-envoy-role
+
+  # The backend needs no AWS API permissions. It only reads identity headers
+  # that VPC Lattice has already authenticated.
+  BackendTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-backend-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-backend-role
+
+  # Amazon ECS infrastructure role. ECS assumes this to register task IPs
+  # into VPC Lattice target groups on your behalf, which removes the need
+  # for a custom target-registration Lambda.
+  EcsLatticeInfraRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Not under service-role/, unlike the sibling ECS infra policies.
+        - arn:aws:iam::aws:policy/AmazonECSInfrastructureRolePolicyForVpcLattice
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ecs-lattice-infra-role
+
+  # ---
+  # CloudWatch log groups
+  # ---
+  ProxyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AWS::StackName}/proxy
+      RetentionInDays: !Ref LogRetentionDays
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AWS::StackName}/backend
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---
+  # ECS clusters
+  # ---
+  ProxyCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}-proxy
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  BackendCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}-backend
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # ---
+  # VPC Lattice — service network
+  # ---
+  LatticeNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub ${AWS::StackName}-network
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-network
+
+  # Service network policy: a coarse guardrail. It admits only the two proxy
+  # task roles, requires the request to have come from the ingress VPC, and
+  # requires the translated x-client-id header to be present (proving the
+  # request passed through the proxy). Per-service policies below then narrow
+  # access to a single role each.
+  NetworkAuthPolicy:
+    Type: AWS::VpcLattice::AuthPolicy
+    Properties:
+      ResourceIdentifier: !Ref LatticeNetwork
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowProxyRolesFromIngressVpc
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt SdkTaskRole.Arn
+                - !GetAtt EnvoyTaskRole.Arn
+            Action: vpc-lattice-svcs:Invoke
+            Resource: '*'
+            Condition:
+              StringEquals:
+                # SourceVpc is a string condition key, so StringEquals is
+                # correct here (not IpAddress).
+                vpc-lattice-svcs:SourceVpc: !Ref IngressVpc
+              StringLike:
+                vpc-lattice-svcs:RequestHeader/x-client-id: '*'
+
+  LatticeIngressAssoc:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref LatticeNetwork
+      VpcIdentifier: !Ref IngressVpc
+      SecurityGroupIds: [!Ref LatticeAssocSg]
+
+  LatticeBackendAssoc:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref LatticeNetwork
+      VpcIdentifier: !Ref BackendVpc
+
+  # ---
+  # VPC Lattice — User Service (reachable only by the SDK proxy)
+  # ---
+  UserSvc:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub ${AWS::StackName}-user
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-user
+
+  UserSvcAssoc:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceIdentifier: !Ref UserSvc
+      ServiceNetworkIdentifier: !Ref LatticeNetwork
+
+  # This policy and the IAM invoke grants below make the 1:1 mapping real.
+  # Only SdkTaskRole may invoke the User Service. Any other principal,
+  # including EnvoyTaskRole, is denied by the implicit deny even though it
+  # holds a valid SigV4 signature and passes the service network policy.
+  # EnvoyTaskRole's own IAM policy does not allow the User Service either;
+  # VPC Lattice requires an allow from both.
+  UserSvcAuthPolicy:
+    Type: AWS::VpcLattice::AuthPolicy
+    Properties:
+      ResourceIdentifier: !Ref UserSvc
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSdkRoleOnly
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt SdkTaskRole.Arn
+            Action: vpc-lattice-svcs:Invoke
+            Resource: '*'
+
+  # Protocol HTTPS with ProtocolVersion GRPC requires the target to serve
+  # TLS. The backend generates a self-signed certificate at startup; VPC
+  # Lattice does not validate target certificates.
+  UserTg:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}-user-tg
+      Type: IP
+      Config:
+        VpcIdentifier: !Ref BackendVpc
+        Port: !Ref BackendGrpcPort
+        Protocol: HTTPS
+        ProtocolVersion: GRPC
+        IpAddressType: IPV4
+        HealthCheck:
+          Enabled: true
+          Protocol: HTTPS
+          # Health checks do not support ProtocolVersion GRPC; HTTP2 with a
+          # broad matcher is the supported way to probe a gRPC target.
+          ProtocolVersion: HTTP2
+          Port: !Ref BackendGrpcPort
+          Path: /
+          HealthCheckIntervalSeconds: 15
+          HealthCheckTimeoutSeconds: 5
+          HealthyThresholdCount: 2
+          UnhealthyThresholdCount: 3
+          Matcher:
+            HttpCode: '200-499'
+
+  UserListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      ServiceIdentifier: !Ref UserSvc
+      Name: grpc
+      Protocol: HTTPS
+      Port: 443
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref UserTg
+              Weight: 100
+
+  # ---
+  # VPC Lattice — Order Service (reachable only by the Envoy proxy)
+  # ---
+  OrderSvc:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub ${AWS::StackName}-order
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-order
+
+  OrderSvcAssoc:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceIdentifier: !Ref OrderSvc
+      ServiceNetworkIdentifier: !Ref LatticeNetwork
+
+  OrderSvcAuthPolicy:
+    Type: AWS::VpcLattice::AuthPolicy
+    Properties:
+      ResourceIdentifier: !Ref OrderSvc
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEnvoyRoleOnly
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt EnvoyTaskRole.Arn
+            Action: vpc-lattice-svcs:Invoke
+            Resource: '*'
+
+  OrderTg:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}-order-tg
+      Type: IP
+      Config:
+        VpcIdentifier: !Ref BackendVpc
+        Port: !Ref BackendGrpcPort
+        Protocol: HTTPS
+        ProtocolVersion: GRPC
+        IpAddressType: IPV4
+        HealthCheck:
+          Enabled: true
+          Protocol: HTTPS
+          ProtocolVersion: HTTP2
+          Port: !Ref BackendGrpcPort
+          Path: /
+          HealthCheckIntervalSeconds: 15
+          HealthCheckTimeoutSeconds: 5
+          HealthyThresholdCount: 2
+          UnhealthyThresholdCount: 3
+          Matcher:
+            HttpCode: '200-499'
+
+  OrderListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      ServiceIdentifier: !Ref OrderSvc
+      Name: grpc
+      Protocol: HTTPS
+      Port: 443
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref OrderTg
+              Weight: 100
+
+  # ---
+  # Least-privilege Lattice invoke grants (standalone, to break the cycle
+  # described above). Each role is scoped to exactly one service ARN, so
+  # least privilege holds in IAM as well as in the service auth policy.
+  # ---
+  # ECS Exec channel, one policy shared by all three task roles.
+  # ssmmessages has no resource-level permissions, so Resource must be "*";
+  # aws:RequestedRegion is the scope that is available. Remove for production.
+  EcsExecChannelPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: EcsExecChannel
+      Roles: [!Ref SdkTaskRole, !Ref EnvoyTaskRole, !Ref BackendTaskRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:OpenDataChannel
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
+
+  SdkInvokeUserSvcPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: InvokeUserService
+      Roles: [!Ref SdkTaskRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: vpc-lattice-svcs:Invoke
+            Resource: !Sub "${UserSvc.Arn}/*"
+
+  EnvoyInvokeOrderSvcPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: InvokeOrderService
+      Roles: [!Ref EnvoyTaskRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: vpc-lattice-svcs:Invoke
+            Resource: !Sub "${OrderSvc.Arn}/*"
+
+  # ---
+  # Task definitions — proxy tier
+  # ---
+  SdkTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-sdk
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt SdkTaskRole.Arn
+      ContainerDefinitions:
+        - Name: sdk-proxy
+          Image: !Ref SdkProxyImageUri
+          Essential: true
+          PortMappings:
+            - Name: grpc
+              ContainerPort: !Ref ProxyListenPort
+              Protocol: tcp
+          Environment:
+            # The SDK proxy exits at startup if this is unset.
+            - Name: LATTICE_USER_SVC
+              Value: !GetAtt UserSvc.DnsEntry.DomainName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: LISTEN_PORT
+              Value: !Sub '${ProxyListenPort}'
+            - Name: LOG_LEVEL
+              Value: INFO
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProxyLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: sdk
+
+  EnvoyTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-envoy
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt EnvoyTaskRole.Arn
+      ContainerDefinitions:
+        - Name: envoy-proxy
+          Image: !Ref EnvoyProxyImageUri
+          Essential: true
+          PortMappings:
+            - Name: grpc
+              ContainerPort: !Ref ProxyListenPort
+              Protocol: tcp
+          Environment:
+            # The Envoy entrypoint exits if either of these is unset.
+            - Name: VPC_LATTICE_ENDPOINT
+              Value: !GetAtt OrderSvc.DnsEntry.DomainName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProxyLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: envoy
+
+  # ---
+  # Task definitions — backend tier
+  # Same image, deployed twice; SERVICE_NAME is what the response echoes back
+  # so a test can prove which service answered.
+  # ---
+  UserTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-user
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt BackendTaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref BackendImageUri
+          Essential: true
+          PortMappings:
+            # PortMappings Name is required: the ECS VPC Lattice
+            # configuration references it by name.
+            - Name: grpc
+              ContainerPort: !Ref BackendGrpcPort
+              Protocol: tcp
+          Environment:
+            - Name: SERVICE_NAME
+              Value: user-service
+            - Name: GRPC_PORT
+              Value: !Sub '${BackendGrpcPort}'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: user
+
+  OrderTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-order
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt BackendTaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref BackendImageUri
+          Essential: true
+          PortMappings:
+            - Name: grpc
+              ContainerPort: !Ref BackendGrpcPort
+              Protocol: tcp
+          Environment:
+            - Name: SERVICE_NAME
+              Value: order-service
+            - Name: GRPC_PORT
+              Value: !Sub '${BackendGrpcPort}'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: order
+
+  # ---
+  # ECS services — proxy tier (behind the ALB)
+  # ---
+  SdkService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - SdkRule
+      - IngressEcrApi
+      - IngressEcrDkr
+      - IngressS3Gw
+    Properties:
+      ServiceName: !Sub ${AWS::StackName}-sdk
+      Cluster: !Ref ProxyCluster
+      TaskDefinition: !Ref SdkTaskDef
+      DesiredCount: !Ref ProxyDesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref IngressPrivateA, !Ref IngressPrivateB]
+          SecurityGroups: [!Ref EcsProxySg]
+      LoadBalancers:
+        - ContainerName: sdk-proxy
+          ContainerPort: !Ref ProxyListenPort
+          TargetGroupArn: !Ref SdkTg
+
+  EnvoyService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - EnvoyRule
+      - IngressEcrApi
+      - IngressEcrDkr
+      - IngressS3Gw
+    Properties:
+      ServiceName: !Sub ${AWS::StackName}-envoy
+      Cluster: !Ref ProxyCluster
+      TaskDefinition: !Ref EnvoyTaskDef
+      DesiredCount: !Ref ProxyDesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref IngressPrivateA, !Ref IngressPrivateB]
+          SecurityGroups: [!Ref EcsProxySg]
+      LoadBalancers:
+        - ContainerName: envoy-proxy
+          ContainerPort: !Ref ProxyListenPort
+          TargetGroupArn: !Ref EnvoyTg
+
+  # ---
+  # ECS services — backend tier (registered into VPC Lattice by ECS)
+  #
+  # VpcLatticeConfigurations makes ECS register and deregister task IPs in the
+  # Lattice target group as tasks start and stop, so no custom registration
+  # Lambda is needed.
+  # ---
+  UserEcsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - UserListener
+      - BackendEcrApi
+      - BackendEcrDkr
+      - BackendS3Gw
+    Properties:
+      ServiceName: !Sub ${AWS::StackName}-user
+      Cluster: !Ref BackendCluster
+      TaskDefinition: !Ref UserTaskDef
+      DesiredCount: !Ref BackendDesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref BackendPrivateA, !Ref BackendPrivateB]
+          SecurityGroups: [!Ref BackendSg]
+      VpcLatticeConfigurations:
+        - PortName: grpc
+          RoleArn: !GetAtt EcsLatticeInfraRole.Arn
+          TargetGroupArn: !GetAtt UserTg.Arn
+
+  OrderEcsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - OrderListener
+      - BackendEcrApi
+      - BackendEcrDkr
+      - BackendS3Gw
+    Properties:
+      ServiceName: !Sub ${AWS::StackName}-order
+      Cluster: !Ref BackendCluster
+      TaskDefinition: !Ref OrderTaskDef
+      DesiredCount: !Ref BackendDesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref BackendPrivateA, !Ref BackendPrivateB]
+          SecurityGroups: [!Ref BackendSg]
+      VpcLatticeConfigurations:
+        - PortName: grpc
+          RoleArn: !GetAtt EcsLatticeInfraRole.Arn
+          TargetGroupArn: !GetAtt OrderTg.Arn
+
+# ---
+# Outputs
+# ---
+Outputs:
+
+  AlbDnsName:
+    Description: ALB DNS name. Use as the gRPC endpoint on port 443.
+    Value: !GetAtt Alb.DNSName
+
+  CognitoTokenEndpoint:
+    Description: OAuth2 token endpoint for the client_credentials grant.
+    Value: !Sub https://${CognitoDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token
+
+  CognitoUserPoolId:
+    Description: Cognito user pool ID.
+    Value: !Ref CognitoUserPool
+
+  CognitoScope:
+    Description: OAuth2 scope to request when fetching a token.
+    Value: https://grpc-lattice-demo/invoke
+
+  SdkClientId:
+    Description: >
+      Cognito app client ID for the SDK path. Retrieve the secret with:
+      aws cognito-idp describe-user-pool-client --user-pool-id <pool> --client-id <id> --query UserPoolClient.ClientSecret --output text
+    Value: !Ref CognitoClientSdk
+
+  EnvoyClientId:
+    Description: Cognito app client ID for the Envoy path.
+    Value: !Ref CognitoClientEnvoy
+
+  UserServiceDns:
+    Description: VPC Lattice DNS name of the User Service (SDK path target).
+    Value: !GetAtt UserSvc.DnsEntry.DomainName
+
+  OrderServiceDns:
+    Description: VPC Lattice DNS name of the Order Service (Envoy path target).
+    Value: !GetAtt OrderSvc.DnsEntry.DomainName
+
+  SdkTaskRoleArn:
+    Description: Workload identity for the SDK path (allowed on User Service only).
+    Value: !GetAtt SdkTaskRole.Arn
+
+  EnvoyTaskRoleArn:
+    Description: Workload identity for the Envoy path (allowed on Order Service only).
+    Value: !GetAtt EnvoyTaskRole.Arn
+
+  ProxyClusterName:
+    Description: ECS cluster running the proxy tier.
+    Value: !Ref ProxyCluster
+
+  BackendClusterName:
+    Description: ECS cluster running the backend services.
+    Value: !Ref BackendCluster
+
+  TestSdkPath:
+    Description: gRPC method to call for the SDK path (expect success).
+    Value: sdk.DemoService/GetInfo
+
+  TestEnvoyPath:
+    Description: gRPC method to call for the Envoy path (expect success).
+    Value: envoy.DemoService/GetInfo
