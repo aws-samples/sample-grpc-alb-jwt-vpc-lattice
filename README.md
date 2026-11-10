@@ -2,9 +2,8 @@
 
 [![License: MIT-0](https://img.shields.io/badge/License-MIT--0-yellow.svg)](https://opensource.org/licenses/MIT-0)
 
-Reference implementation for the AWS blog post *Authenticate and authorize
-external gRPC clients with Application Load Balancer JWT verification and
-Amazon VPC Lattice*.
+Reference implementation for the AWS blog post
+[Authenticate external gRPC clients with Amazon VPC Lattice](https://aws.amazon.com/blogs/networking-and-content-delivery/authenticate-external-grpc-clients-with-amazon-vpc-lattice/).
 
 External machine-to-machine clients authenticate with JSON Web Tokens (JWTs)
 from an identity provider. Amazon VPC Lattice authenticates callers with AWS
